@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <iostream>
 #include <chrono>
+#include <optional>
 #include <Psapi.h>
 #include <mutex>
 #include <queue>
@@ -92,8 +93,8 @@ static BOOL enableGamepadInput = false;
 
 static std::atomic<int> dwPacketNum;
 static std::mutex inputMutex;
-static std::pair<XINPUT_STATE, int> currentReport;
-static std::queue<std::pair<XINPUT_STATE, int>> reportQueue;
+static std::pair<XINPUT_GAMEPAD, std::optional<std::chrono::steady_clock::time_point> > currentReport;
+static std::queue<std::pair<XINPUT_GAMEPAD, std::optional<int> > > reportQueue;
 
 template <typename T>
 inline MH_STATUS MH_CreateHookApiEx(LPCWSTR pszModule, LPCSTR pszProcName, LPVOID pDetour, T** ppOriginal)
@@ -151,7 +152,70 @@ DWORD WINAPI detourXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
 		}
 	}
 	else {
-		// TODO: Report fake inputs
+		/*
+	def get_report(self) -> bytes:
+        with self._joystick_lock:
+            if self.current_report[1] is None:
+                if len(self.report_queue) == 0:
+                    # Current report with infinite repeat and nothing in queue, return report
+                    return self.current_report[0]
+                else:
+                    # Current report with infinite repeat and something in queue, process queue
+                    self.current_report = self.report_queue.popleft()
+                    # print(self.current_report)
+            elif self.current_report[1] < 0:
+                if len(self.report_queue) == 0:
+                    # Current report with no repeats remaining and nothing in queue, use empty report
+                    self.current_report = (EMPTY_REPORT, None)
+                    # print(self.current_report)
+                else:
+                    # Current report with no repeats remaining and something in queue, process queue
+                    self.current_report = self.report_queue.popleft()
+                    # print(self.current_report)
+
+        # Process report, decrement by 1 if not infinitely repeating
+        report, times = self.current_report
+        self.current_report = (report, times - 1 if times is not None else times)
+        return report
+		*/
+		if (!currentReport.second.has_value()) {
+			const std::lock_guard<std::mutex> inputLock(inputMutex);
+			if (reportQueue.empty()) {
+				// Current report with infinite repeat and nothing in queue, return report
+				pState->Gamepad = currentReport.first;
+			}
+			else {
+				// Current report with infinite repeat and something in queue, process queue
+				auto newReport = reportQueue.front();
+				currentReport.first = newReport.first;
+
+				if (newReport.second.has_value()) {
+					auto startTime = std::chrono::high_resolution_clock().now();
+					currentReport.second = startTime + std::chrono::milliseconds(newReport.second.value());
+				}
+
+				reportQueue.pop();
+			}
+		}
+		else if (currentReport.second.value() < std::chrono::high_resolution_clock().now()) {
+			const std::lock_guard<std::mutex> inputLock(inputMutex);
+			if (reportQueue.empty()) {
+				// Current report with no repeats remaining and nothing in queue, use empty report
+				currentReport = std::make_pair(XINPUT_GAMEPAD(), std::optional<std::chrono::steady_clock::time_point>());
+			}
+			else {
+				// Current report with no repeats remaining and something in queue, process queue
+				auto newReport = reportQueue.front();
+				currentReport.first = newReport.first;
+
+				if (newReport.second.has_value()) {
+					auto startTime = std::chrono::high_resolution_clock().now();
+					currentReport.second = startTime + std::chrono::milliseconds(newReport.second.value());
+				}
+
+				reportQueue.pop();
+			}
+		}
 	}
 
 	pState->dwPacketNumber = dwPacketNum.fetch_add(1);
@@ -227,9 +291,9 @@ void CheckForSpecialK()
 	}
 }
 
-void AddReportToQueue(XINPUT_STATE report, int msec) {
+void AddReportToQueue(XINPUT_GAMEPAD gamepad, int msec) {
 	const std::lock_guard<std::mutex> inputLock(inputMutex);
-	reportQueue.emplace(report, msec);
+	reportQueue.emplace(gamepad, msec);
 }
 
 DWORD LittleEndianBytesToUInt32(char* b) {
@@ -245,7 +309,7 @@ SHORT ScaleHidAxisToXInput(BYTE val) {
 	return (SHORT)(range - 32768);
 }
 
-void ReadXInputStateFromHidReportBytes(XINPUT_STATE *state, char* b) {
+void ReadXInputStateFromHidReportBytes(XINPUT_GAMEPAD *gamepad, char* b) {
 	WORD hidButtons = LittleEndianBytesToUInt16(&b[0]);
 	BYTE hidDpad = b[2];
 	BYTE hidLX = b[3];
@@ -253,84 +317,84 @@ void ReadXInputStateFromHidReportBytes(XINPUT_STATE *state, char* b) {
 	BYTE hidRX = b[5];
 	BYTE hidRY = b[6];
 
-	state->Gamepad.bLeftTrigger = 0;
-	state->Gamepad.bRightTrigger = 0;
-	state->Gamepad.sThumbLX = 0;
-	state->Gamepad.sThumbLY = 0;
-	state->Gamepad.sThumbRX = 0;
-	state->Gamepad.sThumbRY = 0;
-	state->Gamepad.wButtons = 0;
+	gamepad->bLeftTrigger = 0;
+	gamepad->bRightTrigger = 0;
+	gamepad->sThumbLX = 0;
+	gamepad->sThumbLY = 0;
+	gamepad->sThumbRX = 0;
+	gamepad->sThumbRY = 0;
+	gamepad->wButtons = 0;
 
 	if (hidButtons & HID_BUTTON_Y) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_X;
+		gamepad->wButtons |= XINPUT_GAMEPAD_X;
 	}
 	if (hidButtons & HID_BUTTON_X) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_Y;
+		gamepad->wButtons |= XINPUT_GAMEPAD_Y;
 	}
 	if (hidButtons & HID_BUTTON_A) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_B;
+		gamepad->wButtons |= XINPUT_GAMEPAD_B;
 	}
 	if (hidButtons & HID_BUTTON_B) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_A;
+		gamepad->wButtons |= XINPUT_GAMEPAD_A;
 	}
 	if (hidButtons & HID_BUTTON_L) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+		gamepad->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
 	}
 	if (hidButtons & HID_BUTTON_R) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+		gamepad->wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
 	}
 	if (hidButtons & HID_BUTTON_ZL) {
-		state->Gamepad.bLeftTrigger = 255;
+		gamepad->bLeftTrigger = 255;
 	}
 	if (hidButtons & HID_BUTTON_ZR) {
-		state->Gamepad.bRightTrigger = 255;
+		gamepad->bRightTrigger = 255;
 	}
 	if (hidButtons & HID_BUTTON_PLUS) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_START;
+		gamepad->wButtons |= XINPUT_GAMEPAD_START;
 	}
 	if (hidButtons & HID_BUTTON_MINUS) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_BACK;
+		gamepad->wButtons |= XINPUT_GAMEPAD_BACK;
 	}
 	if (hidButtons & HID_BUTTON_L3) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
+		gamepad->wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
 	}
 	if (hidButtons & HID_BUTTON_R3) {
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+		gamepad->wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
 	}
 
 	switch (hidDpad) {
 	case HID_DPAD_CENTER:
 		break;
 	case HID_DPAD_UP:
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP;
+		gamepad->wButtons |= XINPUT_GAMEPAD_DPAD_UP;
 		break;
 	case HID_DPAD_DOWN:
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
+		gamepad->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
 		break;
 	case HID_DPAD_LEFT:
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
+		gamepad->wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
 		break;
 	case HID_DPAD_RIGHT:
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+		gamepad->wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
 		break;
 	case HID_DPAD_UP_LEFT:
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_LEFT;
+		gamepad->wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_LEFT;
 		break;
 	case HID_DPAD_UP_RIGHT:
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT;
+		gamepad->wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT;
 		break;
 	case HID_DPAD_DOWN_LEFT:
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT;
+		gamepad->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT;
 		break;
 	case HID_DPAD_DOWN_RIGHT:
-		state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_RIGHT;
+		gamepad->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_RIGHT;
 		break;
 	}
 
-	state->Gamepad.sThumbLX = ScaleHidAxisToXInput(hidLX);
-	state->Gamepad.sThumbLY = ScaleHidAxisToXInput(hidLY);
-	state->Gamepad.sThumbRX = ScaleHidAxisToXInput(hidRX);
-	state->Gamepad.sThumbRY = ScaleHidAxisToXInput(hidRY);
+	gamepad->sThumbLX = ScaleHidAxisToXInput(hidLX);
+	gamepad->sThumbLY = ScaleHidAxisToXInput(hidLY);
+	gamepad->sThumbRX = ScaleHidAxisToXInput(hidRX);
+	gamepad->sThumbRY = ScaleHidAxisToXInput(hidRY);
 }
 
 void ListenOnNamedPipe() {
@@ -357,18 +421,18 @@ void ListenOnNamedPipe() {
 			while (ReadFile(hPipe, buffer, sizeof(buffer) - 1, &dwRead, NULL) != FALSE)
 			{
 				BYTE command = buffer[0];
-				XINPUT_STATE state;
+				XINPUT_GAMEPAD gamepad;
 
 				switch (command) {
 				case REQUEST_UPDATE_REPORT:
-					ReadXInputStateFromHidReportBytes(&state, &buffer[1]);
-					AddReportToQueue(state, -1);
+					ReadXInputStateFromHidReportBytes(&gamepad, &buffer[1]);
+					AddReportToQueue(gamepad, INT_MIN);
 					response = RESPONSE_ACK;
 					WriteFile(hPipe, &response, 1, &dwWritten, NULL);
 					break;
 				case REQUEST_UPDATE_REPORT_FOR_MSEC:
-					ReadXInputStateFromHidReportBytes(&state, &buffer[5]);
-					AddReportToQueue(state, LittleEndianBytesToUInt32(&buffer[1]));
+					ReadXInputStateFromHidReportBytes(&gamepad, &buffer[5]);
+					AddReportToQueue(gamepad, LittleEndianBytesToUInt32(&buffer[1]));
 					response = RESPONSE_ACK;
 					WriteFile(hPipe, &response, 1, &dwWritten, NULL);
 					break;
