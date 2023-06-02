@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <iostream>
 #include <chrono>
+#include <Psapi.h>
 
 #pragma comment(lib, "libMinHook.x64.lib")
 
@@ -116,6 +117,42 @@ void CreateConsole()
 	std::wcin.clear();
 }
 
+static bool endsWith(const std::wstring& str, const std::wstring& suffix)
+{
+	return str.size() >= suffix.size() && 0 == str.compare(str.size() - suffix.size(), suffix.size(), suffix);
+}
+
+void CheckForSpecialK()
+{
+	HANDLE hProcess = GetCurrentProcess();
+	HMODULE lphModule[1024];
+	DWORD cbNeeded;
+	if (EnumProcessModulesEx(hProcess, lphModule, 1024, &cbNeeded, LIST_MODULES_ALL) == 0) {
+		MessageBox(0, L"Error during EnumProcessModulesEx", L"Error during EnumProcessModulesEx", MB_OK);
+		exit(1);
+	}
+
+	DWORD totalCount = cbNeeded / sizeof(HMODULE);
+	WCHAR filename[32768];
+	BOOL specialKFound = false;
+	std::wstring specialKDllName(L"kaldaien_api64.dll");
+	for (DWORD i = 0; i < totalCount; i++) {
+		if (GetModuleFileNameExW(hProcess, lphModule[i], filename, 32768) != 0) {
+			std::wcout << L"Module loaded: " << filename << std::endl;
+			std::wstring filenameStr(filename);
+			if (endsWith(filenameStr, specialKDllName)) {
+				specialKFound = true;
+				break;
+			}
+		}
+	}
+
+	if (!specialKFound) {
+		MessageBox(0, L"Special K not found", L"Special K must be injected", MB_OK);
+		exit(1);
+	}
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule,
 	DWORD  ul_reason_for_call,
 	LPVOID lpReserved
@@ -125,6 +162,8 @@ BOOL APIENTRY DllMain(HMODULE hModule,
 	{
 	case DLL_PROCESS_ATTACH:
 		CreateConsole();
+		CheckForSpecialK();
+
 		start = std::chrono::system_clock::now();
 		reportCount = 0;
 		std::cout << "Attached" << std::endl;
