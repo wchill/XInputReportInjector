@@ -93,7 +93,7 @@ static BOOL enableGamepadInput = false;
 
 static std::atomic<int> dwPacketNum;
 static std::mutex inputMutex;
-static std::pair<XINPUT_GAMEPAD, std::optional<std::chrono::steady_clock::time_point> > currentReport;
+static std::pair<XINPUT_GAMEPAD, std::optional<std::chrono::steady_clock::time_point> > currentReport = std::make_pair(XINPUT_GAMEPAD(), std::optional<std::chrono::steady_clock::time_point>());
 static std::queue<std::pair<XINPUT_GAMEPAD, std::optional<int> > > reportQueue;
 
 template <typename T>
@@ -216,6 +216,7 @@ DWORD WINAPI detourXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
 				reportQueue.pop();
 			}
 		}
+		pState->Gamepad = currentReport.first;
 	}
 
 	pState->dwPacketNumber = dwPacketNum.fetch_add(1);
@@ -291,7 +292,7 @@ void CheckForSpecialK()
 	}
 }
 
-void AddReportToQueue(XINPUT_GAMEPAD gamepad, int msec) {
+void AddReportToQueue(XINPUT_GAMEPAD gamepad, std::optional<int> msec) {
 	const std::lock_guard<std::mutex> inputLock(inputMutex);
 	reportQueue.emplace(gamepad, msec);
 }
@@ -326,16 +327,16 @@ void ReadXInputStateFromHidReportBytes(XINPUT_GAMEPAD *gamepad, char* b) {
 	gamepad->wButtons = 0;
 
 	if (hidButtons & HID_BUTTON_Y) {
-		gamepad->wButtons |= XINPUT_GAMEPAD_X;
-	}
-	if (hidButtons & HID_BUTTON_X) {
 		gamepad->wButtons |= XINPUT_GAMEPAD_Y;
 	}
+	if (hidButtons & HID_BUTTON_X) {
+		gamepad->wButtons |= XINPUT_GAMEPAD_X;
+	}
 	if (hidButtons & HID_BUTTON_A) {
-		gamepad->wButtons |= XINPUT_GAMEPAD_B;
+		gamepad->wButtons |= XINPUT_GAMEPAD_A;
 	}
 	if (hidButtons & HID_BUTTON_B) {
-		gamepad->wButtons |= XINPUT_GAMEPAD_A;
+		gamepad->wButtons |= XINPUT_GAMEPAD_B;
 	}
 	if (hidButtons & HID_BUTTON_L) {
 		gamepad->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
@@ -401,18 +402,21 @@ void ListenOnNamedPipe() {
 	// https://stackoverflow.com/a/26561999/1502893
 	char buffer[1024];
 
-	HANDLE hPipe = CreateNamedPipe(TEXT(R"(\\.\pipe\Pipe)"),
+	HANDLE hPipe = CreateNamedPipe(TEXT(R"(\\.\pipe\XInputReportInjector)"),
 		PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
-		PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+		PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_ACCEPT_REMOTE_CLIENTS,
 		1,
 		1024 * 16,
 		1024 * 16,
 		NMPWAIT_USE_DEFAULT_WAIT,
 		NULL);
+	std::cout << "Named pipe created" << std::endl;
 	while (hPipe != INVALID_HANDLE_VALUE)
 	{
+		std::cout << "Listening for client on named pipe" << std::endl;
 		if (ConnectNamedPipe(hPipe, NULL) != FALSE)   // wait for someone to connect to the pipe
 		{
+			std::cout << "Client connected, waiting for input" << std::endl;
 			DWORD dwWritten;
 			BYTE response = 0x00;	// HOST_ENABLED
 			WriteFile(hPipe, &response, 1, &dwWritten, NULL);
@@ -426,13 +430,13 @@ void ListenOnNamedPipe() {
 				switch (command) {
 				case REQUEST_UPDATE_REPORT:
 					ReadXInputStateFromHidReportBytes(&gamepad, &buffer[1]);
-					AddReportToQueue(gamepad, INT_MIN);
+					AddReportToQueue(gamepad, std::make_optional<int>());
 					response = RESPONSE_ACK;
 					WriteFile(hPipe, &response, 1, &dwWritten, NULL);
 					break;
 				case REQUEST_UPDATE_REPORT_FOR_MSEC:
-					ReadXInputStateFromHidReportBytes(&gamepad, &buffer[5]);
-					AddReportToQueue(gamepad, LittleEndianBytesToUInt32(&buffer[1]));
+					ReadXInputStateFromHidReportBytes(&gamepad, &buffer[1]);
+					AddReportToQueue(gamepad, LittleEndianBytesToUInt32(&buffer[9]));
 					response = RESPONSE_ACK;
 					WriteFile(hPipe, &response, 1, &dwWritten, NULL);
 					break;
@@ -447,6 +451,7 @@ void ListenOnNamedPipe() {
 			}
 		}
 
+		std::cout << "Client disconnected from pipe" << std::endl;
 		DisconnectNamedPipe(hPipe);
 	}
 }
