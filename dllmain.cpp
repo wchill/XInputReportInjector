@@ -93,7 +93,7 @@ static BOOL enableGamepadInput = false;
 
 static std::atomic<int> dwPacketNum;
 static std::mutex inputMutex;
-static std::pair<XINPUT_GAMEPAD, std::optional<std::chrono::steady_clock::time_point> > currentReport = std::make_pair(XINPUT_GAMEPAD(), std::optional<std::chrono::steady_clock::time_point>());
+static std::pair<XINPUT_GAMEPAD, std::optional<int> > currentReport = std::make_pair(XINPUT_GAMEPAD(), std::optional<int>());
 static std::queue<std::pair<XINPUT_GAMEPAD, std::optional<int> > > reportQueue;
 
 template <typename T>
@@ -152,32 +152,6 @@ DWORD WINAPI detourXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
 		}
 	}
 	else {
-		/*
-	def get_report(self) -> bytes:
-        with self._joystick_lock:
-            if self.current_report[1] is None:
-                if len(self.report_queue) == 0:
-                    # Current report with infinite repeat and nothing in queue, return report
-                    return self.current_report[0]
-                else:
-                    # Current report with infinite repeat and something in queue, process queue
-                    self.current_report = self.report_queue.popleft()
-                    # print(self.current_report)
-            elif self.current_report[1] < 0:
-                if len(self.report_queue) == 0:
-                    # Current report with no repeats remaining and nothing in queue, use empty report
-                    self.current_report = (EMPTY_REPORT, None)
-                    # print(self.current_report)
-                else:
-                    # Current report with no repeats remaining and something in queue, process queue
-                    self.current_report = self.report_queue.popleft()
-                    # print(self.current_report)
-
-        # Process report, decrement by 1 if not infinitely repeating
-        report, times = self.current_report
-        self.current_report = (report, times - 1 if times is not None else times)
-        return report
-		*/
 		if (!currentReport.second.has_value()) {
 			const std::lock_guard<std::mutex> inputLock(inputMutex);
 			if (reportQueue.empty()) {
@@ -186,37 +160,31 @@ DWORD WINAPI detourXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
 			}
 			else {
 				// Current report with infinite repeat and something in queue, process queue
-				auto newReport = reportQueue.front();
-				currentReport.first = newReport.first;
+				currentReport = reportQueue.front();
 
-				if (newReport.second.has_value()) {
-					auto startTime = std::chrono::high_resolution_clock().now();
-					currentReport.second = startTime + std::chrono::milliseconds(newReport.second.value());
-				}
-
+				// std::cout << "New report: " << currentReport.first.wButtons << std::endl;
 				reportQueue.pop();
 			}
 		}
-		else if (currentReport.second.value() < std::chrono::high_resolution_clock().now()) {
+		else if (currentReport.second.value() < 0) {
 			const std::lock_guard<std::mutex> inputLock(inputMutex);
 			if (reportQueue.empty()) {
 				// Current report with no repeats remaining and nothing in queue, use empty report
-				currentReport = std::make_pair(XINPUT_GAMEPAD(), std::optional<std::chrono::steady_clock::time_point>());
+				currentReport = std::make_pair(XINPUT_GAMEPAD(), std::optional<int>());
 			}
 			else {
 				// Current report with no repeats remaining and something in queue, process queue
-				auto newReport = reportQueue.front();
-				currentReport.first = newReport.first;
+				currentReport = reportQueue.front();
 
-				if (newReport.second.has_value()) {
-					auto startTime = std::chrono::high_resolution_clock().now();
-					currentReport.second = startTime + std::chrono::milliseconds(newReport.second.value());
-				}
-
+				// std::cout << "New report: " << currentReport.first.wButtons << std::endl;
 				reportQueue.pop();
 			}
 		}
 		pState->Gamepad = currentReport.first;
+
+		if (currentReport.second.has_value()) {
+			currentReport.second = currentReport.second.value() - 1;
+		}
 	}
 
 	pState->dwPacketNumber = dwPacketNum.fetch_add(1);
@@ -297,11 +265,11 @@ void AddReportToQueue(XINPUT_GAMEPAD gamepad, std::optional<int> msec) {
 	reportQueue.emplace(gamepad, msec);
 }
 
-DWORD LittleEndianBytesToUInt32(char* b) {
+DWORD LittleEndianBytesToUInt32(unsigned char* b) {
 	return (b[3] << 24) | (b[2] << 16) | (b[1] << 8) | (b[0]);
 }
 
-WORD LittleEndianBytesToUInt16(char* b) {
+WORD LittleEndianBytesToUInt16(unsigned char* b) {
 	return (b[1] << 8) | (b[0]);
 }
 
@@ -310,7 +278,7 @@ SHORT ScaleHidAxisToXInput(BYTE val) {
 	return (SHORT)(range - 32768);
 }
 
-void ReadXInputStateFromHidReportBytes(XINPUT_GAMEPAD *gamepad, char* b) {
+void ReadXInputStateFromHidReportBytes(XINPUT_GAMEPAD *gamepad, unsigned char* b) {
 	WORD hidButtons = LittleEndianBytesToUInt16(&b[0]);
 	BYTE hidDpad = b[2];
 	BYTE hidLX = b[3];
@@ -400,7 +368,7 @@ void ReadXInputStateFromHidReportBytes(XINPUT_GAMEPAD *gamepad, char* b) {
 
 void ListenOnNamedPipe() {
 	// https://stackoverflow.com/a/26561999/1502893
-	char buffer[1024];
+	unsigned char buffer[1024];
 
 	HANDLE hPipe = CreateNamedPipe(TEXT(R"(\\.\pipe\XInputReportInjector)"),
 		PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
@@ -427,20 +395,37 @@ void ListenOnNamedPipe() {
 				BYTE command = buffer[0];
 				XINPUT_GAMEPAD gamepad;
 
+				DWORD time = 0;
+
 				switch (command) {
 				case REQUEST_UPDATE_REPORT:
+					if (dwRead != 9) {
+						std::cout << "Bad length, ignoring report" << std::endl;
+						continue;
+					}
 					ReadXInputStateFromHidReportBytes(&gamepad, &buffer[1]);
 					AddReportToQueue(gamepad, std::make_optional<int>());
 					response = RESPONSE_ACK;
 					WriteFile(hPipe, &response, 1, &dwWritten, NULL);
 					break;
 				case REQUEST_UPDATE_REPORT_FOR_MSEC:
+					time = LittleEndianBytesToUInt32(&buffer[9]);
+					std::cout << "Received report: " << time << std::endl;
+					if (dwRead != 13) {
+						std::cout << "Bad length, ignoring report" << std::endl;
+						continue;
+					}
 					ReadXInputStateFromHidReportBytes(&gamepad, &buffer[1]);
-					AddReportToQueue(gamepad, LittleEndianBytesToUInt32(&buffer[9]));
+					// Technically inaccurate cause the game polls at 120hz not 125hz, but close enough
+					AddReportToQueue(gamepad, time / 8);
 					response = RESPONSE_ACK;
 					WriteFile(hPipe, &response, 1, &dwWritten, NULL);
 					break;
 				case REQUEST_STOP:
+					if (dwRead != 1) {
+						std::cout << "Bad length, ignoring report" << std::endl;
+						continue;
+					}
 					std::cout << "Stop requested" << std::endl;
 					DisconnectNamedPipe(hPipe);
 					CloseHandle(hPipe);
